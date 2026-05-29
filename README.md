@@ -135,11 +135,8 @@ PRs welcome.
 
 ## Acknowledgments
 
-This wouldn't be lean without these prior projects pointing the way:
 - [whisper.cpp](https://github.com/ggerganov/whisper.cpp) — the workhorse transcription engine.
-- [tonton-golio/meeting-recorder](https://github.com/tonton-golio/meeting-recorder) — proof that ScreenCaptureKit + WhisperKit is the right architecture (build-from-Swift; this repo is the Objective-C/whisper.cpp cousin).
-- [Meetily](https://github.com/Zackriya-Solutions/meetily) and [Hyprnote](https://github.com/fastrepl/hyprnote) — the full notes-suite tools we deliberately *aren't*.
-- [SwiftBar](https://github.com/swiftbar/SwiftBar) — the lovely menu-bar host for the included plugin.
+- [SwiftBar](https://github.com/swiftbar/SwiftBar) — the menu-bar host for the included plugin.
 
 ## License
 
