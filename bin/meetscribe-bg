@@ -1,0 +1,5 @@
+#!/bin/zsh
+# meetscribe-bg — run meetscribe detached so menu-bar/Dock clicks return instantly
+# (stop does whisper + LLM calls in the background).
+DIR="${0:a:h}"
+nohup "$DIR/meetscribe" "$@" >/dev/null 2>&1 &

@@ -1,0 +1,234 @@
+#!/bin/zsh
+# meetscribe — local meeting recorder + transcriber for macOS.
+# Captures system audio (the other side, via ScreenCaptureKit) + your mic in
+# one clean process, transcribes locally with a pluggable whisper backend,
+# de-dupes the speaker echo with a pluggable LLM (optional), mixes the audio,
+# and auto-names the folder.
+#
+#   meetscribe start | stop | toggle | pause | resume | status | watch
+#
+# Configuration (env vars or ~/.config/meetscribe/config):
+#   MEETSCRIBE_OUTDIR          output root (default: ~/Desktop/meet-recordings)
+#   MEETSCRIBE_SCCAP_APP       path to sccap.app (default: ~/Applications/sccap.app)
+#   MEETSCRIBE_TRANSCRIBER     whisper-cpp | openai-whisper   (auto-detected)
+#   MEETSCRIBE_WHISPER_MODEL   model file/name (whisper-cpp: path to .bin;
+#                              openai-whisper: model name like "base.en")
+#   MEETSCRIBE_LLM             claude | ollama | llm | none   (auto-detected)
+#   MEETSCRIBE_LLM_MODEL       model identifier (ollama/llm only)
+
+set -u
+export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin"
+
+# ---- config ---------------------------------------------------------------
+
+[[ -f "$HOME/.config/meetscribe/config" ]] && source "$HOME/.config/meetscribe/config"
+
+OUTDIR="${MEETSCRIBE_OUTDIR:-$HOME/Desktop/meet-recordings}"
+SCCAP_APP="${MEETSCRIBE_SCCAP_APP:-$HOME/Applications/sccap.app}"
+STATE="$HOME/.local/state/meetscribe"
+mkdir -p "$OUTDIR" "$STATE"
+
+# ---- helpers --------------------------------------------------------------
+
+notify(){ osascript -e "display notification \"$2\" with title \"MeetScribe\" subtitle \"$1\"" >/dev/null 2>&1; }
+is_running(){ [[ -f "$STATE/pid" ]] && kill -0 "$(cat "$STATE/pid" 2>/dev/null)" 2>/dev/null; }
+
+detect_transcriber(){
+  [[ -n "${MEETSCRIBE_TRANSCRIBER:-}" ]] && { echo "$MEETSCRIBE_TRANSCRIBER"; return; }
+  command -v whisper-cli   >/dev/null 2>&1 && { echo "whisper-cpp"; return; }
+  command -v whisper       >/dev/null 2>&1 && { echo "openai-whisper"; return; }
+  return 1
+}
+
+detect_llm(){
+  [[ -n "${MEETSCRIBE_LLM:-}" ]] && { echo "$MEETSCRIBE_LLM"; return; }
+  command -v claude  >/dev/null 2>&1 && { echo "claude"; return; }
+  command -v ollama  >/dev/null 2>&1 && { echo "ollama"; return; }
+  command -v llm     >/dev/null 2>&1 && { echo "llm"; return; }
+  echo "none"
+}
+
+# LLM call: $1 = prompt, stdin = content. Stdout = response, or empty if none.
+llm_query(){
+  local prompt="$1" backend; backend="$(detect_llm)"
+  case "$backend" in
+    claude) claude -p "$prompt" 2>/dev/null ;;
+    ollama) { printf '%s\n\n' "$prompt"; cat; } | ollama run "${MEETSCRIBE_LLM_MODEL:-llama3.1:8b}" 2>/dev/null ;;
+    llm)    llm -m "${MEETSCRIBE_LLM_MODEL:-gpt-4o-mini}" -- "$prompt" 2>/dev/null ;;
+    none|*) return 1 ;;
+  esac
+}
+
+# Transcribe one wav -> "startSec<TAB>text" lines on stdout.
+transcribe_wav(){
+  local wav="$1" backend; backend="$(detect_transcriber)" || { echo >&2 "meetscribe: no whisper backend found (install whisper-cpp or openai-whisper)"; return 1; }
+  local w16="${wav:r}.16k.wav"
+  ffmpeg -y -hide_banner -loglevel error -i "$wav" -ar 16000 -ac 1 "$w16" 2>/dev/null || return
+  case "$backend" in
+    whisper-cpp)
+      local model="${MEETSCRIBE_WHISPER_MODEL:-$HOME/.local/share/meetscribe/models/ggml-base.en.bin}"
+      [[ -f "$model" ]] || { echo >&2 "meetscribe: whisper.cpp model not found at $model (set MEETSCRIBE_WHISPER_MODEL)"; rm -f "$w16"; return 1; }
+      whisper-cli -m "$model" -f "$w16" 2>/dev/null \
+        | sed -nE 's/^\[([0-9]+):([0-9]+):([0-9.]+) --> [^]]*\][[:space:]]*(.+)$/\1 \2 \3 \4/p' \
+        | awk '{h=$1;m=$2;s=$3; text=$4; for(i=5;i<=NF;i++) text=text" "$i; printf "%012.3f\t%s\n", h*3600+m*60+s, text}'
+      ;;
+    openai-whisper)
+      local model="${MEETSCRIBE_WHISPER_MODEL:-base.en}"
+      local tmpdir; tmpdir="$(mktemp -d)"
+      whisper "$w16" --model "$model" --output_format srt --output_dir "$tmpdir" --language en >/dev/null 2>&1
+      local srt; srt="$(ls "$tmpdir"/*.srt 2>/dev/null | head -1)"
+      [[ -f "$srt" ]] && python3 - "$srt" <<'PY'
+import re, sys
+with open(sys.argv[1]) as f:
+    blocks = f.read().strip().split("\n\n")
+for b in blocks:
+    lines = b.split("\n")
+    if len(lines) < 2: continue
+    m = re.match(r"(\d+):(\d+):(\d+)[,.](\d+) -->", lines[1])
+    if not m: continue
+    h, mi, s, ms = (int(x) for x in m.groups())
+    sec = h*3600 + mi*60 + s + ms/1000.0
+    text = " ".join(lines[2:]).strip()
+    if text:
+        print(f"{sec:012.3f}\t{text}")
+PY
+      rm -rf "$tmpdir"
+      ;;
+    *) echo >&2 "meetscribe: unsupported transcriber: $backend"; rm -f "$w16"; return 1 ;;
+  esac
+  rm -f "$w16"
+}
+
+build_transcript(){  # $1 dir
+  local dir="$1" them="$1/audio/them.wav" me="$1/audio/me.wav"
+  {
+    [[ -s "$them" ]] && transcribe_wav "$them" | awk -F'\t' '{print $1"\tThem\t"$2}'
+    [[ -s "$me"   ]] && transcribe_wav "$me"   | awk -F'\t' '{print $1"\tMe\t"$2}'
+  } | sort -n \
+    | awk -F'\t' '{mm=int($1/60); ss=int($1)%60; printf "[%02d:%02d %s] %s\n", mm, ss, $2, $3}' > "$dir/transcript.txt"
+}
+
+# De-dup the speaker echo from the [Me] track using the clean [Them] track.
+# Skipped silently if no LLM backend is available.
+clean_transcript(){
+  local dir="$1" tr="$1/transcript.txt" cleaned
+  [[ -s "$tr" ]] || return 0
+  [[ "$(detect_llm)" == "none" ]] && return 0
+  cleaned="$(cat "$tr" | llm_query 'This transcript has two speakers captured on separate mics. [Them] is a CLEAN recording of the other party. [Me] is the user'\''s own mic, which may ALSO have picked up the other party echoing from the room speakers, so [Me] lines can contain repetitions of what [Them] said. Produce a clean, readable transcript. Rules: trust [Them] as the source of truth for the other party; for [Me], REMOVE anything that is an echo or repeat of [Them]'\''s words and keep ONLY what the user actually said; fix obvious speech-to-text errors using context; drop the timestamps; format as natural chronological dialogue with "Them:" and "Me:" labels. Output ONLY the cleaned transcript, nothing else.')"
+  [[ -n "$cleaned" ]] && printf '%s\n' "$cleaned" > "$tr"
+}
+
+combine_audio(){
+  local dir="$1" a="$1/audio/them.wav" m="$1/audio/me.wav"
+  if [[ -s "$a" && -s "$m" ]]; then
+    ffmpeg -y -hide_banner -loglevel error -i "$a" -i "$m" \
+      -filter_complex "[0:a]aresample=48000[x];[1:a]aresample=48000[y];[x][y]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.95" \
+      -c:a aac -b:a 160k "$dir/audio.m4a"
+  elif [[ -s "$a" ]]; then ffmpeg -y -hide_banner -loglevel error -i "$a" -c:a aac -b:a 160k "$dir/audio.m4a"
+  elif [[ -s "$m" ]]; then ffmpeg -y -hide_banner -loglevel error -i "$m" -c:a aac -b:a 160k "$dir/audio.m4a"
+  fi
+  [[ -f "$dir/audio.m4a" ]] && rm -rf "$dir/audio"
+}
+
+# Folder name: "MM-DD-YY-<slug>" generated from the transcript by the LLM.
+# Falls back to "MM-DD-YY-meeting" if no LLM is configured.
+title_folder(){
+  local dir="$1"; [[ -z "$dir" || ! -d "$dir" ]] && { echo "$dir"; return; }
+  local tr="$dir/transcript.txt" base parent slug new mmddyy raw wc
+  base="$(basename "$dir")"
+  if [[ "$base" =~ ([0-9]{4})-([0-9]{2})-([0-9]{2}) ]]; then mmddyy="${match[2]}-${match[3]}-${match[1]:2:2}"
+  else mmddyy="$(date +%m-%d-%y)"; fi
+  parent="$(dirname "$dir")"
+  if [[ -s "$tr" && "$(detect_llm)" != "none" ]]; then
+    raw="$(head -c 8000 "$tr" | llm_query 'You are naming a meeting recording file. In this transcript, "Me" is the host; identify the EXTERNAL party. Reply with ONLY a lowercase hyphenated slug naming that party plus the meeting type: "<company>-<type>" or "<firstname-lastname>-<type>". Prefer the company name; else the external person'\''s name. Type is ONE short word (demo, intro, inquiry, sync, pitch, call). No dates, no other words, max 4 words total. If you cannot confidently identify the party, reply with exactly: untitled. Examples: acme-demo, foo-corp-intro, jane-smith-call.')"
+    wc="$(printf '%s' "$raw" | wc -w | tr -d ' ')"
+    slug="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | tr -d '\n' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-+/-/g')"
+    if [[ -z "$slug" || "$slug" == untitled* || "${wc:-0}" -gt 8 ]]; then slug="meeting"; fi
+    slug="$(printf '%s' "$slug" | cut -d- -f1-5)"; slug="${slug:0:45}"
+  else
+    slug="meeting"
+  fi
+  new="$parent/$mmddyy-$slug"
+  [[ -e "$new" && "$new" != "$dir" ]] && new="$parent/$mmddyy-$slug-$(date +%H%M)"
+  if mv "$dir" "$new" 2>/dev/null; then echo "$new"; else echo "$dir"; fi
+}
+
+# ---- commands -------------------------------------------------------------
+
+cmd_start(){
+  is_running && { echo "already recording"; exit 1; }
+  [[ -d "$SCCAP_APP" ]] || { echo "sccap.app not found at $SCCAP_APP (run scripts/build.sh)"; exit 1; }
+  pkill -f "sccap.app/Contents/MacOS/sccap" 2>/dev/null    # clear any stale capture
+  local dir="$OUTDIR/Meeting $(date '+%Y-%m-%d %I.%M%p')"; mkdir -p "$dir/audio"
+  local pidfile="$dir/audio/sccap.pid"; rm -f "$pidfile"
+  open -a "$SCCAP_APP" --args "$dir/audio" "$pidfile"
+  local pid=""
+  for i in {1..60}; do [[ -s "$pidfile" ]] && { pid="$(cat "$pidfile")"; break; }; sleep 0.1; done
+  if [[ -z "$pid" ]]; then
+    rm -rf "$dir"
+    notify "⚠️ Permission needed" "Grant Screen Recording + Microphone to sccap in System Settings, then retry."
+    echo "capture did not start — grant Screen Recording + Microphone to sccap.app in System Settings, then retry."
+    return 1
+  fi
+  rm -f "$pidfile"
+  echo "$pid" > "$STATE/pid"
+  echo "$dir" > "$STATE/dir"
+  date +%s    > "$STATE/start"
+  notify "🔴 Recording" "Capturing meeting + your mic."
+  echo "recording -> $dir"
+}
+
+cmd_stop(){
+  local p dir; p="$(cat "$STATE/pid" 2>/dev/null || true)"; dir="$(cat "$STATE/dir" 2>/dev/null || true)"
+  rm -f "$STATE/paused"
+  [[ -n "$p" ]] && kill -CONT "$p" 2>/dev/null
+  [[ -n "$p" ]] && kill -INT  "$p" 2>/dev/null
+  for i in {1..50}; do { [[ -z "$p" ]] || ! kill -0 "$p" 2>/dev/null; } && break; sleep 0.1; done
+  rm -f "$STATE/pid" "$STATE/dir" "$STATE/start"
+  [[ -z "$dir" || ! -d "$dir" ]] && { echo "not recording"; exit 0; }
+  notify "⏳ Transcribing" "Processing the recording…"
+  build_transcript "$dir"
+  clean_transcript "$dir"
+  combine_audio "$dir"
+  dir="$(title_folder "$dir")"
+  notify "✅ Saved" "$(basename "$dir")"
+  echo "saved -> $dir"
+}
+
+cmd_pause(){
+  is_running || { echo "not recording"; return; }
+  [[ -f "$STATE/paused" ]] && { echo "already paused"; return; }
+  kill -STOP "$(cat "$STATE/pid")" 2>/dev/null; : > "$STATE/paused"
+  notify "⏸ Paused" "Nothing captured until you resume."
+}
+
+cmd_resume(){
+  [[ -f "$STATE/paused" ]] || { echo "not paused"; return; }
+  kill -CONT "$(cat "$STATE/pid")" 2>/dev/null; rm -f "$STATE/paused"
+  notify "🔴 Recording" "Resumed."
+}
+
+cmd_status(){
+  if is_running; then
+    [[ -f "$STATE/paused" ]] && echo "PAUSED" || echo "RECORDING"
+    echo "dir: $(cat "$STATE/dir" 2>/dev/null)"
+    echo "transcriber: $(detect_transcriber 2>/dev/null || echo none)"
+    echo "llm: $(detect_llm)"
+  else
+    echo "IDLE"
+    echo "transcriber: $(detect_transcriber 2>/dev/null || echo none)"
+    echo "llm: $(detect_llm)"
+  fi
+}
+
+case "${1:-}" in
+  start)        cmd_start ;;
+  stop)         cmd_stop ;;
+  status)       cmd_status ;;
+  toggle)       if is_running; then cmd_stop; else cmd_start; fi ;;
+  pause)        cmd_pause ;;
+  resume)       cmd_resume ;;
+  pause-toggle) if [[ -f "$STATE/paused" ]]; then cmd_resume; else cmd_pause; fi ;;
+  watch)        local d; d="$(cat "$STATE/dir" 2>/dev/null)"; [[ -n "$d" ]] && tail -f "$d/transcript.txt" 2>/dev/null ;;
+  *) echo "usage: meetscribe {start|stop|toggle|pause|resume|status|watch}"; exit 1 ;;
+esac
